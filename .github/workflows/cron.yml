@@ -1,0 +1,18 @@
+name: Roleta Recovery Cron
+
+# Bate no endpoint da Vercel de 5 em 5 min (o robô decide quem recebe).
+# O GitHub Actions pode atrasar alguns minutos — ok pras janelas (15min-6h etc.).
+# A URL+key fica no secret RECOVERY_ENDPOINT (nunca no arquivo).
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hit recovery endpoint
+        run: |
+          curl -sS --max-time 90 "${{ secrets.RECOVERY_ENDPOINT }}" -o resp.json -w "HTTP %{http_code}\n"
+          head -c 800 resp.json; echo
