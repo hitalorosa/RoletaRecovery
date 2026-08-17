@@ -1,5 +1,5 @@
 {
   "functions": {
-    "api/roleta-recovery.py": { "maxDuration": 60 }
+    "api/roleta_recovery.py": { "maxDuration": 60 }
   }
 }
