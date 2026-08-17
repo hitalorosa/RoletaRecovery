@@ -1,1 +1,0 @@
-# Sem dependências externas: o robô usa só a stdlib (urllib, json, hashlib, http.server).
