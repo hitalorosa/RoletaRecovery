@@ -545,7 +545,7 @@ def rodar():
 
 
 # ============ DASHBOARD (rota ?view=dash) ============
-DASH_BUILD = '2026-08-18-19h02'   # muda a cada deploy p/ confirmar visualmente qual versao esta no ar
+DASH_BUILD = '2026-08-18-20h30'   # muda a cada deploy p/ confirmar visualmente qual versao esta no ar
 DASH_YAMPI_PAGINAS = 30        # cobertura p/ cruzar conversao no dash
 AMOSTRA_MIN_CTRL = 200         # abaixo disso o lift ainda e ruido (ver briefing)
 
@@ -870,10 +870,12 @@ def dash_html(env, dia=None):
         f'<h3>Roleta Recovery {status}</h3>'
         '<p>Follow-up automático via WhatsApp pra quem gira a roleta e não compra. '
         'A cada 5 min o robô cruza Supabase (leads) × Yampi (compras) e envia via Nextags só quem não converteu.</p>'
-        '<p>Pedidos atribuídos por telefone (compra depois de receber). '
-        '20% dos leads ficam de fora (grupo de controle) pra medir o ganho real.</p></div>'
+        '<p>Pedidos atribuídos por telefone (compra depois de receber) — não depende de UTM '
+        'sobreviver até o checkout. Cada pessoa recebe no máximo 3 mensagens e para assim que compra.</p></div>'
         f'{erro}{drynote}'
         f'<div class="grid">{metr}</div>'
+        '<div class="sec">As 3 mensagens</div>'
+        f'<div class="msgs">{msgcards}</div>'
         '<div class="sec daysec"><span>Visão diária · '
         f'{"/".join(reversed(dia_val.split("-")))}</span>'
         '<span class="daybar"><button type="button" onclick="shift(-1)">‹</button>'
@@ -881,8 +883,6 @@ def dash_html(env, dia=None):
         "onchange=\"if(this.value)location.search='?dia='+this.value\">"
         '<button type="button" onclick="shift(1)">›</button></span></div>'
         f'<div class="grid">{dia_cards}</div>'
-        '<div class="sec">As 3 mensagens</div>'
-        f'<div class="msgs">{msgcards}</div>'
         f'<div class="sec">Leads que giraram a roleta · {"/".join(reversed(dia_val.split("-")))}</div>'
         f'<p class="cnote"><b>{len(d.get("leads_dia_lista", []))}</b> leads giraram a roleta nesse dia. '
         '10 por página · dados mascarados (página pública).</p>'
