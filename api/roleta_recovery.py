@@ -574,7 +574,9 @@ def dash_dados(env, dia=None):
     SB_KEY = env['LEADS_SUPABASE_SERVICE_ROLE']
     agora = datetime.now(timezone.utc)
     mes = urllib.parse.quote(agora.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat())
-    hoje = urllib.parse.quote(agora.replace(hour=0, minute=0, second=0, microsecond=0).isoformat())
+    # "hoje" = fuso BR (UTC-3), nao UTC
+    hoje_br = urllib.parse.quote((agora - timedelta(hours=3)).replace(
+        hour=0, minute=0, second=0, microsecond=0).isoformat())
 
     d = {
         'mode': env.get('ROLETA_MODE', 'dry-run').lower(),
@@ -588,7 +590,10 @@ def dash_dados(env, dia=None):
     for i in (1, 2, 3):
         col = f'msg{i}_enviada_em'
         envt[i] = sb_count(SB_URL, SB_KEY, f'{col}=not.is.null') or 0
-        envh[i] = sb_count(SB_URL, SB_KEY, f'{col}=gte.{hoje}') or 0
+        # "hoje" = quem GIROU a roleta hoje (created_at), nao quando a msg saiu.
+        # Filtrando por col>=hoje contava o backlog dos dias de dry-run inteiro,
+        # ja que uma msg de um lead de 2 dias atras podia sair hoje mesmo.
+        envh[i] = sb_count(SB_URL, SB_KEY, f'{col}=not.is.null&created_at=gte.{hoje_br}') or 0
     d['env_total'], d['env_hoje'] = envt, envh
     d['msgs_total'] = sum(envt.values())
     d['msgs_hoje'] = sum(envh.values())
