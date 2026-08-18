@@ -634,6 +634,20 @@ def dash_dados(env, dia=None):
         d['erro'] = f'{type(ex).__name__}: {str(ex)[:150]}'
     d['ped'] = ped
     d['dia'].pop('_receb', None)
+
+    # lista do grupo de controle (mascarada — a pagina e publica)
+    d['ctrl_lista'] = []
+    try:
+        for r in sb_rows(SB_URL, SB_KEY,
+                'select=phone,email,created_at,coupon&controle=is.true&order=created_at.desc', limite=200):
+            d['ctrl_lista'].append({
+                'phone': _mask_phone(r.get('phone')),
+                'email': _mask_email(r.get('email')),
+                'data': _dt_br(r.get('created_at')),
+                'cupom': r.get('coupon') or '—',
+            })
+    except Exception:
+        pass
     return d
 
 
@@ -647,6 +661,30 @@ def _fmt(n):
 
 def _money(v):
     return 'R$ ' + f'{(v or 0):,.0f}'.replace(',', '.')
+
+
+def _mask_phone(p):
+    dig = re.sub(r'\D', '', str(p or ''))
+    if len(dig) < 4:
+        return '—'
+    ddd = dig[-11:-9] if len(dig) >= 11 else dig[:2]
+    return f'({ddd}) ••••-{dig[-4:]}'
+
+
+def _mask_email(e):
+    e = str(e or '')
+    if '@' not in e:
+        return '—'
+    nome, dom = e.split('@', 1)
+    return (nome[:2] if len(nome) > 2 else nome[:1]) + '•••@' + dom
+
+
+def _dt_br(s):
+    try:
+        t = datetime.fromisoformat(str(s).replace('Z', '+00:00')) - timedelta(hours=3)
+        return t.strftime('%d/%m %H:%M')
+    except Exception:
+        return str(s)[:10]
 
 
 def dash_html(env, dia=None):
@@ -773,6 +811,16 @@ def dash_html(env, dia=None):
         '.mr i{font-style:normal;color:var(--mut);font-size:11px}'
         '.warn{background:rgba(224,179,72,.10);color:#e6c565;border:1px solid rgba(224,179,72,.25);'
         'padding:11px 14px;border-radius:10px;font-size:13px;margin:14px 0}'
+        '.cnote{color:var(--mut);font-size:12px;line-height:1.5;margin:0 2px 12px}'
+        '.tblwrap{background:var(--card);border:1px solid var(--line);border-radius:14px;'
+        'overflow:auto;max-height:420px}'
+        '.tbl{width:100%;border-collapse:collapse;font-size:13px}'
+        '.tbl th{position:sticky;top:0;background:var(--card);text-align:left;color:var(--mut);'
+        'font-size:11px;letter-spacing:.4px;text-transform:uppercase;padding:11px 14px;'
+        'border-bottom:1px solid var(--line)}'
+        '.tbl td{padding:10px 14px;border-bottom:1px solid var(--line)}'
+        '.tbl tbody tr:last-child td{border-bottom:0}'
+        '.tbl tbody tr:hover{background:rgba(255,255,255,.02)}'
         '.foot{color:var(--mut);font-size:12px;margin-top:24px;line-height:1.5}'
         '</style></head><body><div class="wrap">'
         '<div class="top"><div class="brand"><h1>Roleta Recovery</h1><p>Dry Skin · recuperação via WhatsApp</p></div>'
@@ -795,6 +843,17 @@ def dash_html(env, dia=None):
         f'<div class="grid">{dia_cards}</div>'
         '<div class="sec">As 3 mensagens</div>'
         f'<div class="msgs">{msgcards}</div>'
+        '<div class="sec">Grupo de controle · quem ficou de fora</div>'
+        f'<p class="cnote">São os <b>{_fmt(d["controle"])}</b> leads que o robô segura de '
+        'propósito (não recebem nenhuma mensagem) pra medir o ganho real da recovery. '
+        f'Mostrando os {len(d.get("ctrl_lista", []))} mais recentes · dados mascarados (página pública).</p>'
+        '<div class="tblwrap"><table class="tbl"><thead><tr>'
+        '<th>Girou em</th><th>Telefone</th><th>E-mail</th><th>Cupom</th></tr></thead><tbody>'
+        + (''.join(
+            f'<tr><td>{c["data"]}</td><td>{c["phone"]}</td><td>{c["email"]}</td><td>{c["cupom"]}</td></tr>'
+            for c in d.get('ctrl_lista', []))
+           or '<tr><td colspan="4" style="color:var(--mut)">Ninguém no controle ainda.</td></tr>')
+        + '</tbody></table></div>'
         f'<p class="foot">Atualizado {d["agora"]} · atualiza sozinho a cada 2 min · '
         f'{_fmt(d["leads_total"])} leads no total desde o início.</p>'
         '</div>'
