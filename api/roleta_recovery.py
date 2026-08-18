@@ -151,16 +151,22 @@ def reservar_leads(url, key, col, atraso_min, idade_max_min):
     return rows or []
 
 
-def liberar_travados(url, key, col, minutos=30):
+def liberar_travados(url, key, col, minutos=30, idade_max_min=4320):
     """Reserva orfa: col preenchido (reservado) mas o *_enviada_em correspondente
     continua nulo passado `minutos`. Acontece se uma excecao no meio do processamento
     da janela impede o codigo de chegar no envio ou no desfazer_reserva -> o lead
-    fica preso pra sempre sem receber nada. Libera (col=null) pra ser retentado."""
+    fica preso pra sempre sem receber nada. Libera (col=null) pra ser retentado.
+
+    Restrito a created_at recente (idade_max_min): os ~8900 leads do BACKFILL
+    (marcados de proposito na virada pra live, pra nao disparar retroativo) tem
+    esse mesmo padrao (col preenchido + enviada_em nulo) mas sao antigos -> sem
+    esse filtro essa funcao desmarcava o backfill inteiro a cada rodada."""
     envcol = col.replace('recovery_', '').replace('_at', '') + '_enviada_em'
     limite = urllib.parse.quote((datetime.now(timezone.utc) - timedelta(minutes=minutos)).isoformat())
+    desde = urllib.parse.quote((datetime.now(timezone.utc) - timedelta(minutes=idade_max_min)).isoformat())
     H = sb_headers(key, {'Prefer': 'return=representation'})
     body = json.dumps({col: None}).encode('utf-8')
-    qs = f'{col}=not.is.null&{col}=lte.{limite}&{envcol}=is.null'
+    qs = f'{col}=not.is.null&{col}=lte.{limite}&{envcol}=is.null&created_at=gte.{desde}'
     try:
         _, rows = http_json(f'{url}/rest/v1/roleta_leads?{qs}', headers=H,
                             data=body, method='PATCH', timeout=30)
@@ -447,7 +453,7 @@ def rodar():
         j = {'msg': nome, 'flow_id': flow_id, 'janela_min': [atraso, idade_max]}
         try:
             if not dry:
-                j['liberados_travados'] = liberar_travados(SB_URL, SB_KEY, col)
+                j['liberados_travados'] = liberar_travados(SB_URL, SB_KEY, col, idade_max_min=idade_max)
             if dry:
                 # dry-run NAO reserva e NAO envia: so conta quantos entrariam
                 agora = datetime.now(timezone.utc)
