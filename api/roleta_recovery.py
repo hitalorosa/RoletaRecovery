@@ -52,7 +52,7 @@ from datetime import datetime, timezone, timedelta
 # vies de "compraria de qualquer jeito" e o mesmo nos dois e some na subtracao.
 # A diferenca entre eles e o ganho real da campanha, e vira um numero unico:
 # "quem recebeu comprou X% mais que quem nao recebeu".
-CONTROLE_PCT = 20        # fatia do controle, em %
+CONTROLE_PCT = 0         # fatia do controle, em % (0 = sem controle, dispara pra todos)
 
 
 def eh_controle(lead_id):
@@ -635,16 +635,19 @@ def dash_dados(env, dia=None):
     d['ped'] = ped
     d['dia'].pop('_receb', None)
 
-    # lista do grupo de controle (mascarada — a pagina e publica)
-    d['ctrl_lista'] = []
+    # lista de TODOS os leads que giraram a roleta NO DIA (mascarada — pagina publica)
+    d['leads_dia_lista'] = []
     try:
         for r in sb_rows(SB_URL, SB_KEY,
-                'select=phone,email,created_at,coupon&controle=is.true&order=created_at.desc', limite=200):
-            d['ctrl_lista'].append({
+                'select=phone,email,created_at,coupon,msg1_enviada_em,msg2_enviada_em,msg3_enviada_em'
+                f'&created_at=gte.{QI}&created_at=lt.{QF}&order=created_at.desc', limite=1000):
+            nrec = sum(1 for k in ('msg1_enviada_em', 'msg2_enviada_em', 'msg3_enviada_em') if r.get(k))
+            d['leads_dia_lista'].append({
                 'phone': _mask_phone(r.get('phone')),
                 'email': _mask_email(r.get('email')),
                 'data': _dt_br(r.get('created_at')),
                 'cupom': r.get('coupon') or '—',
+                'status': f'{nrec}/3 msg' if nrec else 'na fila',
             })
     except Exception:
         pass
@@ -715,13 +718,13 @@ def dash_html(env, dia=None):
         kpi('RECEITA RECUPERADA', _money(rec), f'{_fmt(ped)} pedidos atribuídos', 'accent') +
         kpi('PEDIDOS RECUPERADOS', _fmt(ped), f'de {_fmt(recb)} que receberam') +
         kpi('TICKET MÉDIO', _money(ticket), 'por pedido recuperado') +
-        kpi('GANHO vs CONTROLE', f'{sgl}{lift:.1f} pp', f'recebeu {conv_r:.1f}% · controle {conv_c:.1f}%', liftcls)
+        kpi('CONVERSÃO', f'{conv_r:.1f}%', f'{_fmt(ped)} de {_fmt(recb)} compraram', 'accent')
     )
 
     metr = (
         kpi('LEADS PROCESSADOS (MÊS)', _fmt(d['leads_mes']), 'giraram a roleta') +
         kpi('MSGS ENVIADAS', _fmt(d['msgs_total']), f'hoje {_fmt(d["msgs_hoje"])}') +
-        kpi('GRUPO DE CONTROLE', _fmt(d['controle']), '20% não recebe (mede ganho)') +
+        kpi('LEADS (TOTAL)', _fmt(d['leads_total']), 'desde o início') +
         kpi('YAMPI INDEXADA', _fmt(d['yampi']), 'pedidos p/ atribuição')
     )
 
@@ -821,6 +824,11 @@ def dash_html(env, dia=None):
         '.tbl td{padding:10px 14px;border-bottom:1px solid var(--line)}'
         '.tbl tbody tr:last-child td{border-bottom:0}'
         '.tbl tbody tr:hover{background:rgba(255,255,255,.02)}'
+        '.pager{display:flex;align-items:center;justify-content:center;gap:14px;margin:12px 0 0}'
+        '.pager button{background:var(--card);border:1px solid var(--line);color:var(--tx);'
+        'border-radius:8px;width:34px;height:34px;font-size:17px;cursor:pointer;line-height:1}'
+        '.pager button:hover{border-color:var(--ac)}'
+        '.pager #pginfo{color:var(--mut);font-size:13px;min-width:110px;text-align:center}'
         '.foot{color:var(--mut);font-size:12px;margin-top:24px;line-height:1.5}'
         '</style></head><body><div class="wrap">'
         '<div class="top"><div class="brand"><h1>Roleta Recovery</h1><p>Dry Skin · recuperação via WhatsApp</p></div>'
@@ -832,7 +840,7 @@ def dash_html(env, dia=None):
         'A cada 5 min o robô cruza Supabase (leads) × Yampi (compras) e envia via Nextags só quem não converteu.</p>'
         '<p>Pedidos atribuídos por telefone (compra depois de receber). '
         '20% dos leads ficam de fora (grupo de controle) pra medir o ganho real.</p></div>'
-        f'{erro}{drynote}{aviso}'
+        f'{erro}{drynote}'
         f'<div class="grid">{metr}</div>'
         '<div class="sec daysec"><span>Visão diária · '
         f'{"/".join(reversed(dia_val.split("-")))}</span>'
@@ -843,23 +851,31 @@ def dash_html(env, dia=None):
         f'<div class="grid">{dia_cards}</div>'
         '<div class="sec">As 3 mensagens</div>'
         f'<div class="msgs">{msgcards}</div>'
-        '<div class="sec">Grupo de controle · quem ficou de fora</div>'
-        f'<p class="cnote">São os <b>{_fmt(d["controle"])}</b> leads que o robô segura de '
-        'propósito (não recebem nenhuma mensagem) pra medir o ganho real da recovery. '
-        f'Mostrando os {len(d.get("ctrl_lista", []))} mais recentes · dados mascarados (página pública).</p>'
-        '<div class="tblwrap"><table class="tbl"><thead><tr>'
-        '<th>Girou em</th><th>Telefone</th><th>E-mail</th><th>Cupom</th></tr></thead><tbody>'
+        f'<div class="sec">Leads que giraram a roleta · {"/".join(reversed(dia_val.split("-")))}</div>'
+        f'<p class="cnote"><b>{len(d.get("leads_dia_lista", []))}</b> leads giraram a roleta nesse dia. '
+        '10 por página · dados mascarados (página pública).</p>'
+        '<div class="tblwrap"><table class="tbl" id="leadstbl"><thead><tr>'
+        '<th>Girou em</th><th>Telefone</th><th>E-mail</th><th>Cupom</th><th>Recovery</th></tr></thead><tbody>'
         + (''.join(
-            f'<tr><td>{c["data"]}</td><td>{c["phone"]}</td><td>{c["email"]}</td><td>{c["cupom"]}</td></tr>'
-            for c in d.get('ctrl_lista', []))
-           or '<tr><td colspan="4" style="color:var(--mut)">Ninguém no controle ainda.</td></tr>')
+            f'<tr><td>{c["data"]}</td><td>{c["phone"]}</td><td>{c["email"]}</td>'
+            f'<td>{c["cupom"]}</td><td>{c["status"]}</td></tr>'
+            for c in d.get('leads_dia_lista', []))
+           or '<tr><td colspan="5" style="color:var(--mut)">Nenhum lead nesse dia.</td></tr>')
         + '</tbody></table></div>'
+        '<div class="pager"><button type="button" onclick="pgm(-1)">‹</button>'
+        '<span id="pginfo"></span>'
+        '<button type="button" onclick="pgm(1)">›</button></div>'
         f'<p class="foot">Atualizado {d["agora"]} · atualiza sozinho a cada 2 min · '
         f'{_fmt(d["leads_total"])} leads no total desde o início.</p>'
         '</div>'
         '<script>function shift(n){var i=document.getElementById("dp");'
         'var d=new Date((i.value||new Date().toISOString().slice(0,10))+"T12:00:00");'
-        'd.setDate(d.getDate()+n);location.search="?dia="+d.toISOString().slice(0,10);}</script>'
+        'd.setDate(d.getDate()+n);location.search="?dia="+d.toISOString().slice(0,10);}'
+        'var PG=1,PP=10;function paginar(){var rs=document.querySelectorAll("#leadstbl tbody tr");'
+        'var n=rs.length,tp=Math.max(1,Math.ceil(n/PP));if(PG>tp)PG=tp;if(PG<1)PG=1;'
+        'rs.forEach(function(r,i){r.style.display=(i>=(PG-1)*PP&&i<PG*PP)?"":"none";});'
+        'var el=document.getElementById("pginfo");if(el)el.textContent="Página "+PG+" de "+tp;}'
+        'function pgm(n){PG+=n;paginar();}paginar();</script>'
         '</body></html>')
 
 
