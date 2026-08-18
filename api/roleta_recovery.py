@@ -545,6 +545,7 @@ def rodar():
 
 
 # ============ DASHBOARD (rota ?view=dash) ============
+DASH_BUILD = '2026-08-18-19h02'   # muda a cada deploy p/ confirmar visualmente qual versao esta no ar
 DASH_YAMPI_PAGINAS = 30        # cobertura p/ cruzar conversao no dash
 AMOSTRA_MIN_CTRL = 200         # abaixo disso o lift ainda e ruido (ver briefing)
 
@@ -897,7 +898,8 @@ def dash_html(env, dia=None):
         '<span id="pginfo"></span>'
         '<button type="button" onclick="pgm(1)">›</button></div>'
         f'<p class="foot">Atualizado {d["agora"]} · atualiza sozinho a cada 2 min · '
-        f'{_fmt(d["leads_total"])} leads no total desde o início.</p>'
+        f'{_fmt(d["leads_total"])} leads no total desde o início. '
+        f'<span style="opacity:.4">build {DASH_BUILD}</span></p>'
         '</div>'
         '<script>function shift(n){var i=document.getElementById("dp");'
         'var d=new Date((i.value||new Date().toISOString().slice(0,10))+"T12:00:00");'
