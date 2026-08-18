@@ -547,150 +547,201 @@ def dash_dados(env):
     SB_URL = env['LEADS_SUPABASE_URL'].rstrip('/')
     SB_KEY = env['LEADS_SUPABASE_SERVICE_ROLE']
     agora = datetime.now(timezone.utc)
+    mes = urllib.parse.quote(agora.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat())
+    hoje = urllib.parse.quote(agora.replace(hour=0, minute=0, second=0, microsecond=0).isoformat())
 
-    def desde(dias):
-        return urllib.parse.quote((agora - timedelta(days=dias)).isoformat())
-
-    # ---- operacional: contagens por periodo (HEAD, rapido) ----
-    periodos = [('Hoje (24h)', 1), ('7 dias', 7), ('30 dias', 30), ('Total', None)]
-    tabela = []
-    for nome, d in periodos:
-        jd = (lambda campo: '' if d is None else f'&{campo}=gte.{desde(d)}')
-        tabela.append({
-            'nome': nome,
-            'leads': sb_count(SB_URL, SB_KEY, '' if d is None else f'created_at=gte.{desde(d)}'),
-            'm1':    sb_count(SB_URL, SB_KEY, 'msg1_enviada_em=not.is.null' + jd('msg1_enviada_em')),
-            'm2':    sb_count(SB_URL, SB_KEY, 'msg2_enviada_em=not.is.null' + jd('msg2_enviada_em')),
-            'm3':    sb_count(SB_URL, SB_KEY, 'msg3_enviada_em=not.is.null' + jd('msg3_enviada_em')),
-            'ctrl':  sb_count(SB_URL, SB_KEY, 'controle=is.true' + jd('created_at')),
-        })
-
-    # ---- conversao: recebeu vs controle, cruzando Yampi ----
-    conv = {'recebidos': 0, 'receb_comprou': 0, 'controle': 0, 'ctrl_comprou': 0,
-            'receita': 0.0, 'yampi': 0, 'amostra_ok': False, 'erro': None}
-    try:
-        idx, _ = yampi_indice_pedidos(env['YAMPI_ALIAS'], env['YAMPI_TOKEN'],
-                                      env['YAMPI_SECRET'], paginas=DASH_YAMPI_PAGINAS)
-        conv['yampi'] = len(idx)
-        recebeu = sb_rows(SB_URL, SB_KEY,
-                          'select=phone,msg1_enviada_em&msg1_enviada_em=not.is.null')
-        controle = sb_rows(SB_URL, SB_KEY,
-                           'select=phone,created_at&controle=is.true')
-        conv['recebidos'] = len(recebeu)
-        conv['controle'] = len(controle)
-        for r in recebeu:
-            if comprou_depois(idx, norm_phone(r.get('phone')), r.get('msg1_enviada_em')):
-                conv['receb_comprou'] += 1
-        for c in controle:
-            if comprou_depois(idx, norm_phone(c.get('phone')), c.get('created_at')):
-                conv['ctrl_comprou'] += 1
-        conv['amostra_ok'] = conv['controle'] >= AMOSTRA_MIN_CTRL and conv['recebidos'] >= 50
-    except Exception as ex:
-        conv['erro'] = f'{type(ex).__name__}: {str(ex)[:150]}'
-
-    return {
+    d = {
         'mode': env.get('ROLETA_MODE', 'dry-run').lower(),
         'agora': agora.strftime('%d/%m/%Y %H:%M UTC'),
-        'tabela': tabela,
-        'conv': conv,
+        'erro': None, 'yampi': 0,
     }
+    # ---- contagens rapidas (HEAD, nao transfere linhas) ----
+    d['leads_mes'] = sb_count(SB_URL, SB_KEY, f'created_at=gte.{mes}')
+    d['leads_total'] = sb_count(SB_URL, SB_KEY, '')
+    envt, envh = {}, {}
+    for i in (1, 2, 3):
+        col = f'msg{i}_enviada_em'
+        envt[i] = sb_count(SB_URL, SB_KEY, f'{col}=not.is.null') or 0
+        envh[i] = sb_count(SB_URL, SB_KEY, f'{col}=gte.{hoje}') or 0
+    d['env_total'], d['env_hoje'] = envt, envh
+    d['msgs_total'] = sum(envt.values())
+    d['msgs_hoje'] = sum(envh.values())
+    d['controle'] = sb_count(SB_URL, SB_KEY, 'controle=is.true') or 0
+
+    # ---- atribuicao via Yampi: pedidos + receita recuperada, e controle ----
+    ped = {1: 0, 2: 0, 3: 0}
+    d.update({'pedidos': 0, 'receita': 0.0, 'recebidos': 0, 'ctrl_comprou': 0})
+    try:
+        idx, pagos = yampi_indice_pedidos(env['YAMPI_ALIAS'], env['YAMPI_TOKEN'],
+                                          env['YAMPI_SECRET'], paginas=DASH_YAMPI_PAGINAS)
+        d['yampi'] = len(idx)
+        pagos_fone = {}
+        for p in pagos:
+            pagos_fone.setdefault(norm_phone(p['fone_fmt']), []).append((p['data'], p['valor']))
+        recebidos = sb_rows(SB_URL, SB_KEY,
+            'select=phone,msg1_enviada_em,msg2_enviada_em,msg3_enviada_em'
+            '&or=(msg1_enviada_em.not.is.null,msg2_enviada_em.not.is.null,msg3_enviada_em.not.is.null)')
+        d['recebidos'] = len(recebidos)
+        for r in recebidos:
+            ordens = pagos_fone.get(norm_phone(r.get('phone')), [])
+            ts = {}
+            for i in (1, 2, 3):
+                q = norm_dt(r.get(f'msg{i}_enviada_em'))
+                if q:
+                    ts[i] = q
+                    if any(dt > q for dt, _ in ordens):
+                        ped[i] += 1
+            if ts:
+                cedo = min(ts.values())
+                aps = sorted([(dt, v) for dt, v in ordens if dt > cedo])
+                if aps:
+                    d['pedidos'] += 1
+                    d['receita'] += aps[0][1]
+        controle = sb_rows(SB_URL, SB_KEY, 'select=phone,created_at&controle=is.true')
+        for c in controle:
+            if comprou_depois(idx, norm_phone(c.get('phone')), c.get('created_at')):
+                d['ctrl_comprou'] += 1
+    except Exception as ex:
+        d['erro'] = f'{type(ex).__name__}: {str(ex)[:150]}'
+    d['ped'] = ped
+    return d
 
 
 def _pct(n, d):
     return (100.0 * n / d) if d else 0.0
 
 
+def _fmt(n):
+    return '—' if n is None else f'{int(n):,}'.replace(',', '.')
+
+
+def _money(v):
+    return 'R$ ' + f'{(v or 0):,.0f}'.replace(',', '.')
+
+
 def dash_html(env):
     try:
-        m = dash_dados(env)
+        d = dash_dados(env)
     except Exception as ex:
         return f'<h1>Erro no dash</h1><pre>{type(ex).__name__}: {str(ex)[:300]}</pre>'
 
-    c = m['conv']
-    cr = _pct(c['receb_comprou'], c['recebidos'])   # conversao de quem recebeu
-    cc = _pct(c['ctrl_comprou'], c['controle'])      # conversao do controle
-    lift = cr - cc
-    live = m['mode'] == 'live'
+    live = d['mode'] == 'live'
+    ped, rec = d['pedidos'], d['receita']
+    ticket = (rec / ped) if ped else 0
+    recb = d.get('recebidos', 0)
+    conv_r = _pct(ped, recb)
+    conv_c = _pct(d.get('ctrl_comprou', 0), d['controle'])
+    lift = conv_r - conv_c
+    amostra_ok = d['controle'] >= AMOSTRA_MIN_CTRL and recb >= 50
 
-    def cel(v):
-        return '—' if v is None else f'{v:,}'.replace(',', '.')
+    status = ('<span class="pill on">● No ar</span>' if live
+              else '<span class="pill off">● Dry-run</span>')
+    sgl = '+' if lift >= 0 else ''
+    liftcls = 'up' if lift >= 0 else 'down'
 
-    linhas = ''
-    for r in m['tabela']:
-        linhas += (
-            '<tr>'
-            f'<td class="p">{r["nome"]}</td>'
-            f'<td>{cel(r["leads"])}</td>'
-            f'<td>{cel(r["m1"])}</td>'
-            f'<td>{cel(r["m2"])}</td>'
-            f'<td>{cel(r["m3"])}</td>'
-            f'<td>{cel(r["ctrl"])}</td>'
-            '</tr>')
+    def kpi(label, valor, sub, cls=''):
+        return (f'<div class="kpi {cls}"><span class="lbl">{label}</span>'
+                f'<b class="val">{valor}</b><span class="sub">{sub}</span></div>')
 
-    if c['erro']:
-        bloco_conv = f'<p class="warn">Não deu pra medir conversão agora: {c["erro"]}</p>'
-    else:
-        aviso = '' if c['amostra_ok'] else (
-            f'<p class="warn">⚠️ Amostra ainda pequena (controle {c["controle"]} / '
-            f'mínimo {AMOSTRA_MIN_CTRL}). O ganho abaixo é só uma prévia — '
-            'só vira número confiável com mais dados.</p>')
-        sinal = '+' if lift >= 0 else ''
-        cls = 'good' if lift >= 0 else 'bad'
-        bloco_conv = (
-            aviso +
-            '<div class="cards">'
-            f'<div class="card"><span>Recebeu a recovery</span><b>{cr:.1f}%</b>'
-            f'<small>{c["receb_comprou"]} de {c["recebidos"]} compraram</small></div>'
-            f'<div class="card"><span>Grupo de controle</span><b>{cc:.1f}%</b>'
-            f'<small>{c["ctrl_comprou"]} de {c["controle"]} compraram</small></div>'
-            f'<div class="card lift {cls}"><span>Ganho da recovery</span>'
-            f'<b>{sinal}{lift:.1f} pp</b><small>vs quem não recebeu</small></div>'
-            '</div>')
+    kpis = (
+        kpi('RECEITA RECUPERADA', _money(rec), f'{_fmt(ped)} pedidos atribuídos', 'accent') +
+        kpi('PEDIDOS RECUPERADOS', _fmt(ped), f'de {_fmt(recb)} que receberam') +
+        kpi('TICKET MÉDIO', _money(ticket), 'por pedido recuperado') +
+        kpi('GANHO vs CONTROLE', f'{sgl}{lift:.1f} pp', f'recebeu {conv_r:.1f}% · controle {conv_c:.1f}%', liftcls)
+    )
 
-    badge = ('<span class="badge live">LIVE — enviando</span>' if live
-             else '<span class="badge dry">DRY-RUN — só medindo</span>')
+    metr = (
+        kpi('LEADS PROCESSADOS (MÊS)', _fmt(d['leads_mes']), 'giraram a roleta') +
+        kpi('MSGS ENVIADAS', _fmt(d['msgs_total']), f'hoje {_fmt(d["msgs_hoje"])}') +
+        kpi('GRUPO DE CONTROLE', _fmt(d['controle']), '20% não recebe (mede ganho)') +
+        kpi('YAMPI INDEXADA', _fmt(d['yampi']), 'pedidos p/ atribuição')
+    )
+
+    janelas = [
+        ('MSG 1', '15 min – 6 h após girar', d['env_total'][1], d['env_hoje'][1], d['ped'][1]),
+        ('MSG 2', '3 h – 24 h após girar',   d['env_total'][2], d['env_hoje'][2], d['ped'][2]),
+        ('MSG 3', '24 h – 72 h após girar',  d['env_total'][3], d['env_hoje'][3], d['ped'][3]),
+    ]
+    tag = ('<span class="tag on">ATIVA</span>' if live else '<span class="tag off">DRY-RUN</span>')
+    msgcards = ''
+    for nome, quando, envn, envh, pedn in janelas:
+        msgcards += (
+            f'<div class="msg"><div class="msg-h"><b>{nome}</b>{tag}</div>'
+            f'<div class="when">{quando}</div>'
+            f'<div class="mr"><div><span>enviadas</span><em>{_fmt(envn)}</em>'
+            f'<i>hoje {_fmt(envh)}</i></div>'
+            f'<div><span>pedidos</span><em>{_fmt(pedn) if pedn else "—"}</em></div></div></div>')
+
+    erro = f'<div class="warn">Não deu pra cruzar a Yampi agora: {d["erro"]}</div>' if d['erro'] else ''
+    aviso = '' if (amostra_ok or not live) else (
+        f'<div class="warn">Amostra ainda pequena (controle {d["controle"]}/{AMOSTRA_MIN_CTRL}). '
+        'O ganho vs controle vira número confiável com mais dados.</div>')
+    drynote = ('' if live else
+               '<div class="warn">Em <b>dry-run</b>: o robô só mede, não envia. '
+               'Receita/pedidos/enviadas ficam zerados até virar <b>live</b>.</div>')
 
     return (
         '<!doctype html><html lang="pt-br"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         '<meta http-equiv="refresh" content="120">'
         '<title>Roleta Recovery — Dry Skin</title><style>'
-        ':root{--bg:#0f1115;--card:#181b22;--line:#262b36;--tx:#e7eaf0;--mut:#8a93a6;'
-        '--ac:#43b89f;--good:#43b89f;--bad:#e5635e;}'
+        ':root{--bg:#0a0b0e;--card:#131519;--line:#23262d;--tx:#e9edf3;--mut:#7d8694;'
+        '--ac:#43b89f;--up:#43b89f;--down:#e5635e;}'
         '*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);'
-        'font-family:-apple-system,Segoe UI,Roboto,sans-serif;padding:24px}'
-        '.wrap{max-width:820px;margin:0 auto}h1{font-size:20px;margin:0 0 4px}'
-        '.sub{color:var(--mut);font-size:13px;margin-bottom:18px}'
-        '.badge{font-size:11px;font-weight:700;padding:3px 9px;border-radius:20px;margin-left:8px}'
-        '.badge.live{background:#123a30;color:var(--good)}'
-        '.badge.dry{background:#3a2f12;color:#e0b348}'
-        'h2{font-size:14px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px;'
-        'margin:26px 0 10px;font-weight:700}'
-        'table{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;'
-        'overflow:hidden;font-size:14px}'
-        'th,td{padding:11px 12px;text-align:right;border-bottom:1px solid var(--line)}'
-        'th:first-child,td.p{text-align:left;color:var(--mut)}'
-        'th{font-size:11px;text-transform:uppercase;color:var(--mut);letter-spacing:.4px}'
-        'tr:last-child td{border-bottom:0}tr:last-child{font-weight:700}'
-        '.cards{display:flex;gap:12px;flex-wrap:wrap}'
-        '.card{flex:1;min-width:150px;background:var(--card);border:1px solid var(--line);'
-        'border-radius:12px;padding:16px}.card span{color:var(--mut);font-size:12px}'
-        '.card b{display:block;font-size:28px;margin:6px 0 2px}.card small{color:var(--mut);font-size:12px}'
-        '.card.lift.good b{color:var(--good)}.card.lift.bad b{color:var(--bad)}'
-        '.warn{background:#3a2f12;color:#e6c565;padding:10px 12px;border-radius:10px;font-size:13px}'
-        '.foot{color:var(--mut);font-size:12px;margin-top:22px;line-height:1.5}'
+        "font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;padding:28px 22px}"
+        '.wrap{max-width:1080px;margin:0 auto}'
+        '.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:22px;gap:12px;flex-wrap:wrap}'
+        '.brand h1{font-size:19px;margin:0;letter-spacing:.2px}'
+        '.brand p{margin:2px 0 0;color:var(--mut);font-size:12px}'
+        '.pill{font-size:12px;font-weight:700;padding:6px 12px;border-radius:20px}'
+        '.pill.on{background:rgba(67,184,159,.14);color:var(--ac)}'
+        '.pill.off{background:rgba(224,179,72,.14);color:#e0b348}'
+        '.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}'
+        '@media(max-width:820px){.grid{grid-template-columns:repeat(2,1fr)}}'
+        '@media(max-width:480px){.grid{grid-template-columns:1fr}}'
+        '.kpi{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 18px 16px}'
+        '.kpi .lbl{color:var(--mut);font-size:11px;font-weight:700;letter-spacing:.5px}'
+        '.kpi .val{display:block;font-size:30px;font-weight:750;margin:8px 0 3px;letter-spacing:-.5px}'
+        '.kpi .sub{color:var(--mut);font-size:12px}'
+        '.kpi.accent .val{color:var(--ac)}.kpi.up .val{color:var(--up)}.kpi.down .val{color:var(--down)}'
+        '.banner{background:var(--card);border:1px solid var(--line);border-radius:14px;'
+        'padding:16px 18px;margin:16px 0}'
+        '.banner h3{margin:0 0 6px;font-size:15px}.banner h3 .pill{margin-left:8px;vertical-align:middle}'
+        '.banner p{margin:3px 0;color:var(--mut);font-size:13px;line-height:1.5}'
+        '.sec{color:var(--mut);font-size:11px;font-weight:700;letter-spacing:.6px;'
+        'text-transform:uppercase;margin:22px 2px 12px}'
+        '.msgs{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}'
+        '@media(max-width:820px){.msgs{grid-template-columns:1fr}}'
+        '.msg{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px;'
+        'border-left:3px solid var(--ac)}'
+        '.msg-h{display:flex;align-items:center;justify-content:space-between}'
+        '.msg-h b{font-size:15px}'
+        '.tag{font-size:10px;font-weight:800;letter-spacing:.5px;padding:3px 8px;border-radius:6px}'
+        '.tag.on{background:rgba(67,184,159,.14);color:var(--ac)}'
+        '.tag.off{background:rgba(224,179,72,.14);color:#e0b348}'
+        '.when{color:var(--mut);font-size:12px;margin:4px 0 14px}'
+        '.mr{display:flex;gap:22px}.mr span{display:block;color:var(--mut);font-size:11px}'
+        '.mr em{font-style:normal;font-size:22px;font-weight:750;display:block;margin-top:2px}'
+        '.mr i{font-style:normal;color:var(--mut);font-size:11px}'
+        '.warn{background:rgba(224,179,72,.10);color:#e6c565;border:1px solid rgba(224,179,72,.25);'
+        'padding:11px 14px;border-radius:10px;font-size:13px;margin:14px 0}'
+        '.foot{color:var(--mut);font-size:12px;margin-top:24px;line-height:1.5}'
         '</style></head><body><div class="wrap">'
-        f'<h1>Roleta Recovery · Dry Skin {badge}</h1>'
-        f'<div class="sub">Atualizado {m["agora"]} · atualiza sozinho a cada 2 min · Yampi: {c["yampi"]} pedidos indexados</div>'
-        '<h2>Mensagens enviadas</h2>'
-        '<table><tr><th>Período</th><th>Leads roleta</th><th>MSG1</th><th>MSG2</th>'
-        f'<th>MSG3</th><th>Controle</th></tr>{linhas}</table>'
-        '<h2>Conversão · recebeu vs controle</h2>'
-        f'{bloco_conv}'
-        '<p class="foot">O <b>ganho</b> é quanto quem recebeu a recovery comprou a mais que o '
-        'grupo de controle (20% que não recebe nada, de propósito, pra medir o efeito real). '
-        'Atribuição por telefone cruzando a Yampi — não depende de UTM nem cupom. '
-        f'{"Em DRY-RUN nada é enviado; os números de envio ficam zerados até virar LIVE." if not live else ""}</p>'
+        '<div class="top"><div class="brand"><h1>Roleta Recovery</h1><p>Dry Skin · recuperação via WhatsApp</p></div>'
+        f'{status}</div>'
+        f'<div class="grid">{kpis}</div>'
+        '<div class="banner">'
+        f'<h3>Roleta Recovery {status}</h3>'
+        '<p>Follow-up automático via WhatsApp pra quem gira a roleta e não compra. '
+        'A cada 5 min o robô cruza Supabase (leads) × Yampi (compras) e envia via Nextags só quem não converteu.</p>'
+        '<p>Pedidos atribuídos por telefone (compra depois de receber). '
+        '20% dos leads ficam de fora (grupo de controle) pra medir o ganho real.</p></div>'
+        f'{erro}{drynote}{aviso}'
+        f'<div class="grid">{metr}</div>'
+        '<div class="sec">As 3 mensagens</div>'
+        f'<div class="msgs">{msgcards}</div>'
+        f'<p class="foot">Atualizado {d["agora"]} · atualiza sozinho a cada 2 min · '
+        f'{_fmt(d["leads_total"])} leads no total desde o início.</p>'
         '</div></body></html>')
 
 
@@ -726,18 +777,19 @@ class handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if not autorizado(self.path, self.headers):
-            return self._responder(401, {'erro': 'nao autorizado'})
+        # Com key valida e SEM pedir dash -> roda a recovery (caminho do cron).
+        # Sem key (raiz do site) OU pedindo dash -> serve o painel visual (leitura).
         q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path or '').query)
-        if 'dash' in q or (q.get('view') or [''])[0] == 'dash':
+        quer_dash = 'dash' in q or (q.get('view') or [''])[0] == 'dash'
+        if autorizado(self.path, self.headers) and not quer_dash:
             try:
-                return self._responder_html(200, dash_html(os.environ))
+                return self._responder(200, rodar())
             except Exception as e:
-                return self._responder_html(500, f'<pre>{type(e).__name__}: {e}</pre>')
+                return self._responder(500, {'erro': f'{type(e).__name__}: {e}'})
         try:
-            self._responder(200, rodar())
+            self._responder_html(200, dash_html(os.environ))
         except Exception as e:
-            self._responder(500, {'erro': f'{type(e).__name__}: {e}'})
+            self._responder_html(500, f'<pre>{type(e).__name__}: {e}</pre>')
 
     def do_POST(self):
         self.do_GET()
