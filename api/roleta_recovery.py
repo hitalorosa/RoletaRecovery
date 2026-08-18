@@ -543,7 +543,7 @@ def sb_rows(url, key, filtro, limite=8000):
     return rows or []
 
 
-def dash_dados(env):
+def dash_dados(env, dia=None):
     SB_URL = env['LEADS_SUPABASE_URL'].rstrip('/')
     SB_KEY = env['LEADS_SUPABASE_SERVICE_ROLE']
     agora = datetime.now(timezone.utc)
@@ -568,6 +568,29 @@ def dash_dados(env):
     d['msgs_hoje'] = sum(envh.values())
     d['controle'] = sb_count(SB_URL, SB_KEY, 'controle=is.true') or 0
 
+    # ---- visao do DIA escolhido (fuso BR = UTC-3) ----
+    try:
+        base = datetime.strptime(dia, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        base = (agora - timedelta(hours=3)).replace(hour=0, minute=0, second=0, microsecond=0)
+        dia = base.strftime('%Y-%m-%d')
+    ini = base + timedelta(hours=3)          # 00:00 BR = 03:00 UTC
+    fim = ini + timedelta(days=1)
+    QI = urllib.parse.quote(ini.isoformat()); QF = urllib.parse.quote(fim.isoformat())
+    dd = {'data': dia, 'pedidos': 0, 'receita': 0.0, '_receb': {}}
+    dd['leads'] = sb_count(SB_URL, SB_KEY, f'created_at=gte.{QI}&created_at=lt.{QF}')
+    dd['controle'] = sb_count(SB_URL, SB_KEY, f'controle=is.true&created_at=gte.{QI}&created_at=lt.{QF}')
+    envd = {}
+    for i in (1, 2, 3):
+        col = f'msg{i}_enviada_em'
+        envd[i] = sb_count(SB_URL, SB_KEY, f'{col}=gte.{QI}&{col}=lt.{QF}') or 0
+        for r in sb_rows(SB_URL, SB_KEY, f'select=phone,{col}&{col}=gte.{QI}&{col}=lt.{QF}'):
+            ph = norm_phone(r.get('phone')); t = norm_dt(r.get(col))
+            if ph and t and (ph not in dd['_receb'] or t < dd['_receb'][ph]):
+                dd['_receb'][ph] = t
+    dd['env'] = envd; dd['msgs'] = sum(envd.values())
+    d['dia'] = dd
+
     # ---- atribuicao via Yampi: pedidos + receita recuperada, e controle ----
     ped = {1: 0, 2: 0, 3: 0}
     d.update({'pedidos': 0, 'receita': 0.0, 'recebidos': 0, 'ctrl_comprou': 0})
@@ -578,6 +601,12 @@ def dash_dados(env):
         pagos_fone = {}
         for p in pagos:
             pagos_fone.setdefault(norm_phone(p['fone_fmt']), []).append((p['data'], p['valor']))
+        # atribuicao do DIA escolhido (recebeu no dia e comprou depois)
+        for ph, t in d['dia']['_receb'].items():
+            aps = sorted([(x, v) for x, v in pagos_fone.get(ph, []) if x > t])
+            if aps:
+                d['dia']['pedidos'] += 1
+                d['dia']['receita'] += aps[0][1]
         recebidos = sb_rows(SB_URL, SB_KEY,
             'select=phone,msg1_enviada_em,msg2_enviada_em,msg3_enviada_em'
             '&or=(msg1_enviada_em.not.is.null,msg2_enviada_em.not.is.null,msg3_enviada_em.not.is.null)')
@@ -604,6 +633,7 @@ def dash_dados(env):
     except Exception as ex:
         d['erro'] = f'{type(ex).__name__}: {str(ex)[:150]}'
     d['ped'] = ped
+    d['dia'].pop('_receb', None)
     return d
 
 
@@ -619,9 +649,9 @@ def _money(v):
     return 'R$ ' + f'{(v or 0):,.0f}'.replace(',', '.')
 
 
-def dash_html(env):
+def dash_html(env, dia=None):
     try:
-        d = dash_dados(env)
+        d = dash_dados(env, dia)
     except Exception as ex:
         return f'<h1>Erro no dash</h1><pre>{type(ex).__name__}: {str(ex)[:300]}</pre>'
 
@@ -655,6 +685,17 @@ def dash_html(env):
         kpi('MSGS ENVIADAS', _fmt(d['msgs_total']), f'hoje {_fmt(d["msgs_hoje"])}') +
         kpi('GRUPO DE CONTROLE', _fmt(d['controle']), '20% não recebe (mede ganho)') +
         kpi('YAMPI INDEXADA', _fmt(d['yampi']), 'pedidos p/ atribuição')
+    )
+
+    dd = d.get('dia', {})
+    envd = dd.get('env', {})
+    dia_val = dd.get('data', '')
+    dia_cards = (
+        kpi('LEADS DO DIA', _fmt(dd.get('leads')), 'giraram a roleta') +
+        kpi('MSGS ENVIADAS', _fmt(dd.get('msgs')),
+            f"M1 {_fmt(envd.get(1))} · M2 {_fmt(envd.get(2))} · M3 {_fmt(envd.get(3))}") +
+        kpi('PEDIDOS RECUPERADOS', _fmt(dd.get('pedidos')), 'receberam e compraram', 'accent') +
+        kpi('RECEITA RECUPERADA', _money(dd.get('receita')), 'no dia', 'accent')
     )
 
     janelas = [
@@ -710,6 +751,13 @@ def dash_html(env):
         '.banner p{margin:3px 0;color:var(--mut);font-size:13px;line-height:1.5}'
         '.sec{color:var(--mut);font-size:11px;font-weight:700;letter-spacing:.6px;'
         'text-transform:uppercase;margin:22px 2px 12px}'
+        '.daysec{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}'
+        '.daybar{display:flex;align-items:center;gap:6px}'
+        '.daybar button{background:var(--card);border:1px solid var(--line);color:var(--tx);'
+        'border-radius:8px;width:32px;height:34px;font-size:17px;cursor:pointer;line-height:1}'
+        '.daybar button:hover{border-color:var(--ac)}'
+        '.daybar input{background:var(--card);border:1px solid var(--line);color:var(--tx);'
+        'border-radius:8px;padding:7px 10px;font-size:13px;color-scheme:dark}'
         '.msgs{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}'
         '@media(max-width:820px){.msgs{grid-template-columns:1fr}}'
         '.msg{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px;'
@@ -738,11 +786,22 @@ def dash_html(env):
         '20% dos leads ficam de fora (grupo de controle) pra medir o ganho real.</p></div>'
         f'{erro}{drynote}{aviso}'
         f'<div class="grid">{metr}</div>'
+        '<div class="sec daysec"><span>Visão diária · '
+        f'{"/".join(reversed(dia_val.split("-")))}</span>'
+        '<span class="daybar"><button type="button" onclick="shift(-1)">‹</button>'
+        f'<input type="date" id="dp" value="{dia_val}" '
+        "onchange=\"if(this.value)location.search='?dia='+this.value\">"
+        '<button type="button" onclick="shift(1)">›</button></span></div>'
+        f'<div class="grid">{dia_cards}</div>'
         '<div class="sec">As 3 mensagens</div>'
         f'<div class="msgs">{msgcards}</div>'
         f'<p class="foot">Atualizado {d["agora"]} · atualiza sozinho a cada 2 min · '
         f'{_fmt(d["leads_total"])} leads no total desde o início.</p>'
-        '</div></body></html>')
+        '</div>'
+        '<script>function shift(n){var i=document.getElementById("dp");'
+        'var d=new Date((i.value||new Date().toISOString().slice(0,10))+"T12:00:00");'
+        'd.setDate(d.getDate()+n);location.search="?dia="+d.toISOString().slice(0,10);}</script>'
+        '</body></html>')
 
 
 def autorizado(path, headers):
@@ -786,8 +845,11 @@ class handler(BaseHTTPRequestHandler):
                 return self._responder(200, rodar())
             except Exception as e:
                 return self._responder(500, {'erro': f'{type(e).__name__}: {e}'})
+        dia = (q.get('dia') or [None])[0]
+        if dia and not re.match(r'^\d{4}-\d{2}-\d{2}$', dia):
+            dia = None
         try:
-            self._responder_html(200, dash_html(os.environ))
+            self._responder_html(200, dash_html(os.environ, dia))
         except Exception as e:
             self._responder_html(500, f'<pre>{type(e).__name__}: {e}</pre>')
 
