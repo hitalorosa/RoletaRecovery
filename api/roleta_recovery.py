@@ -927,11 +927,13 @@ def autorizado(path, headers):
 
 # ============ VERCEL HANDLER ============
 class handler(BaseHTTPRequestHandler):
-    def _responder(self, code, payload):
+    def _responder(self, code, payload, extra=None):
         body = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -948,7 +950,12 @@ class handler(BaseHTTPRequestHandler):
         # Sem key (raiz do site) OU pedindo dash -> serve o painel visual (leitura).
         q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path or '').query)
         quer_dash = 'dash' in q or (q.get('view') or [''])[0] == 'dash'
-        if autorizado(self.path, self.headers) and not quer_dash:
+        # ?view=json devolve os MESMOS dados do painel em JSON, pro dash de CRM
+        # (repo hitalorosa/DASHBOARD) montar a tela com a cara dele. Nao expoe nada
+        # a mais que a pagina publica: dash_dados ja mascara telefone/e-mail da
+        # lista de leads e descarta os telefones crus da atribuicao.
+        quer_json = (q.get('view') or [''])[0] == 'json' or 'json' in q
+        if autorizado(self.path, self.headers) and not quer_dash and not quer_json:
             try:
                 return self._responder(200, rodar())
             except Exception as e:
@@ -956,6 +963,19 @@ class handler(BaseHTTPRequestHandler):
         dia = (q.get('dia') or [None])[0]
         if dia and not re.match(r'^\d{4}-\d{2}-\d{2}$', dia):
             dia = None
+
+        if quer_json:
+            # Token opcional: sem DASH_READ_TOKEN a rota e publica como a pagina.
+            # Com ele, so responde a quem mandar ?token= igual.
+            esperado = os.environ.get('DASH_READ_TOKEN', '')
+            if esperado and (q.get('token') or [''])[0] != esperado:
+                return self._responder(401, {'erro': 'token invalido'})
+            cors = {'Access-Control-Allow-Origin': '*', 'Cache-Control': 'public, max-age=60'}
+            try:
+                return self._responder(200, dash_dados(os.environ, dia), cors)
+            except Exception as e:
+                return self._responder(500, {'erro': f'{type(e).__name__}: {e}'}, cors)
+
         try:
             self._responder_html(200, dash_html(os.environ, dia))
         except Exception as e:
