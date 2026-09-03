@@ -240,6 +240,12 @@ def yampi_indice_pedidos(alias, token, secret, paginas=YAMPI_PAGINAS):
         try:
             _, data = http_json(f'{base}&page={page}', headers=H, timeout=25)
         except Exception:
+            # Falhar na 1a pagina significa indice VAZIO. Antes isso passava em
+            # silencio: o painel mostrava R$ 0,00 de receita, como se a recovery
+            # nao tivesse recuperado nada, sem nenhum aviso. Zero por falha e
+            # zero por resultado tem que ser distinguiveis.
+            if page == 1:
+                raise
             break
         rows = (data or {}).get('data') or []
         if not rows:
@@ -590,11 +596,16 @@ def sb_rows_all(url, key, filtro, pagina=1000):
         off += len(rows)
 
 
-def dash_dados(env, dia=None):
+def dash_dados(env, dia=None, de=None, ate=None):
     SB_URL = env['LEADS_SUPABASE_URL'].rstrip('/')
     SB_KEY = env['LEADS_SUPABASE_SERVICE_ROLE']
     agora = datetime.now(timezone.utc)
-    mes = urllib.parse.quote(agora.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat())
+    # O mes tem que comecar na mesma hora que o "hoje": 00:00 de Brasilia. Cortando
+    # em 00:00 UTC, as 3 ultimas horas do ultimo dia do mes anterior entravam no mes
+    # novo (eram 12 leads do dia 31/08 contados como setembro).
+    ini_mes = (agora - timedelta(hours=3)).replace(day=1, hour=0, minute=0, second=0,
+                                                   microsecond=0) + timedelta(hours=3)
+    mes = urllib.parse.quote(ini_mes.isoformat())
     # "hoje" = fuso BR (UTC-3), nao UTC
     hoje_br = urllib.parse.quote((agora - timedelta(hours=3)).replace(
         hour=0, minute=0, second=0, microsecond=0).isoformat())
@@ -627,23 +638,39 @@ def dash_dados(env, dia=None):
     d['usd_brl'] = float(env.get('USD_BRL') or 5.15)
     d['gasto'] = d['msgs_total'] * d['custo_msg_usd'] * d['usd_brl']
 
-    # ---- visao do DIA escolhido (fuso BR = UTC-3) ----
-    try:
-        base = datetime.strptime(dia, '%Y-%m-%d').replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError):
-        base = (agora - timedelta(hours=3)).replace(hour=0, minute=0, second=0, microsecond=0)
-        dia = base.strftime('%Y-%m-%d')
-    ini = base + timedelta(hours=3)          # 00:00 BR = 03:00 UTC
-    fim = ini + timedelta(days=1)
+    # ---- visao do PERIODO escolhido (fuso BR = UTC-3) ----
+    # `dia` continua aceito e vira um periodo de um dia so, pra nao quebrar link
+    # antigo nem o dash de CRM, que le d['dia'].
+    def _data(txt):
+        try:
+            return datetime.strptime(txt, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return None
+
+    hoje_base = (agora - timedelta(hours=3)).replace(hour=0, minute=0, second=0, microsecond=0)
+    b_de = _data(de) or _data(dia) or hoje_base
+    b_ate = _data(ate) or _data(dia) or (b_de if (de or dia) else hoje_base)
+    if b_ate < b_de:
+        b_de, b_ate = b_ate, b_de
+    de_s, ate_s = b_de.strftime('%Y-%m-%d'), b_ate.strftime('%Y-%m-%d')
+
+    ini = b_de + timedelta(hours=3)                       # 00:00 BR = 03:00 UTC
+    fim = b_ate + timedelta(days=1, hours=3)              # fim do ultimo dia, exclusivo
     QI = urllib.parse.quote(ini.isoformat()); QF = urllib.parse.quote(fim.isoformat())
-    dd = {'data': dia, 'pedidos': 0, 'receita': 0.0, '_receb': {}}
+    dias_no_periodo = (b_ate - b_de).days + 1
+
+    dd = {'data': de_s, 'de': de_s, 'ate': ate_s, 'dias': dias_no_periodo,
+          'pedidos': 0, 'receita': 0.0, '_receb': {}}
     dd['leads'] = sb_count(SB_URL, SB_KEY, f'created_at=gte.{QI}&created_at=lt.{QF}')
     dd['controle'] = sb_count(SB_URL, SB_KEY, f'controle=is.true&created_at=gte.{QI}&created_at=lt.{QF}')
     envd = {}
     for i in (1, 2, 3):
         col = f'msg{i}_enviada_em'
         envd[i] = sb_count(SB_URL, SB_KEY, f'{col}=gte.{QI}&{col}=lt.{QF}') or 0
-        for r in sb_rows(SB_URL, SB_KEY, f'select=phone,{col}&{col}=gte.{QI}&{col}=lt.{QF}'):
+        # sb_rows_all: num periodo longo isso passa de 1000 facil, e o corte
+        # silencioso estragaria a atribuicao do periodo do mesmo jeito que
+        # estragava a do total.
+        for r in sb_rows_all(SB_URL, SB_KEY, f'select=phone,{col}&{col}=gte.{QI}&{col}=lt.{QF}'):
             ph = norm_phone(r.get('phone')); t = norm_dt(r.get(col))
             if ph and t and (ph not in dd['_receb'] or t < dd['_receb'][ph]):
                 dd['_receb'][ph] = t
@@ -700,10 +727,14 @@ def dash_dados(env, dia=None):
 
     # lista de TODOS os leads que giraram a roleta NO DIA (mascarada — pagina publica)
     d['leads_dia_lista'] = []
+    # A lista e so pra olhar: num mes inteiro sao milhares de linhas e a pagina
+    # fica impraticavel. Mostra as 500 mais recentes; o numero certo vem do
+    # contador `leads` do periodo, que e uma contagem, nao um len() da lista.
+    LIMITE_LISTA = 500
     try:
-        for r in sb_rows(SB_URL, SB_KEY,
+        for r in sb_rows(SB_URL, SB_KEY, limite=LIMITE_LISTA, filtro=
                 'select=phone,email,created_at,coupon,msg1_enviada_em,msg2_enviada_em,msg3_enviada_em'
-                f'&created_at=gte.{QI}&created_at=lt.{QF}&order=created_at.desc', limite=1000):
+                f'&created_at=gte.{QI}&created_at=lt.{QF}&order=created_at.desc'):
             nrec = sum(1 for k in ('msg1_enviada_em', 'msg2_enviada_em', 'msg3_enviada_em') if r.get(k))
             d['leads_dia_lista'].append({
                 'phone': _mask_phone(r.get('phone')),
@@ -764,9 +795,9 @@ def _dt_br(s):
         return str(s)[:10]
 
 
-def dash_html(env, dia=None):
+def dash_html(env, dia=None, de=None, ate=None):
     try:
-        d = dash_dados(env, dia)
+        d = dash_dados(env, dia, de, ate)
     except Exception as ex:
         return f'<h1>Erro no dash</h1><pre>{type(ex).__name__}: {str(ex)[:300]}</pre>'
 
@@ -809,6 +840,11 @@ def dash_html(env, dia=None):
     dd = d.get('dia', {})
     envd = dd.get('env', {})
     dia_val = dd.get('data', '')
+    p_de, p_ate = dd.get('de', dia_val), dd.get('ate', dia_val)
+    def _br(x):
+        return '/'.join(reversed(x.split('-'))) if x else ''
+    rotulo_periodo = ('Visão diária · ' + _br(p_de)) if p_de == p_ate else (
+        f'Período · {_br(p_de)} a {_br(p_ate)} · {dd.get("dias", 1)} dias')
     dia_cards = (
         kpi('LEADS DO DIA', _fmt(dd.get('leads')), 'giraram a roleta') +
         kpi('MSGS ENVIADAS', _fmt(dd.get('msgs')),
@@ -862,6 +898,10 @@ def dash_html(env, dia=None):
         '.grid.g3{grid-template-columns:repeat(3,1fr)}'
         '@media(max-width:820px){.grid{grid-template-columns:repeat(2,1fr)}}'
         '@media(max-width:480px){.grid{grid-template-columns:1fr}}'
+        '.presets{display:flex;flex-wrap:wrap;gap:8px;margin:-4px 0 14px}'
+        '.presets button{background:var(--card);border:1px solid var(--line);color:var(--tx);border-radius:999px;padding:5px 13px;font-size:12px;font-weight:600;cursor:pointer}'
+        '.presets button:hover{border-color:var(--ac);color:var(--ac)}'
+        '.daybar .ate{color:var(--mut);font-size:12px;padding:0 2px}'
         '.kpi{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 18px 16px}'
         '.kpi .lbl{color:var(--mut);font-size:11px;font-weight:700;letter-spacing:.5px}'
         '.kpi .val{display:block;font-size:30px;font-weight:750;margin:8px 0 3px;letter-spacing:-.5px}'
@@ -925,15 +965,23 @@ def dash_html(env, dia=None):
         f'<div class="grid">{metr}</div>'
         '<div class="sec">As 3 mensagens</div>'
         f'<div class="msgs">{msgcards}</div>'
-        '<div class="sec daysec"><span>Visão diária · '
-        f'{"/".join(reversed(dia_val.split("-")))}</span>'
-        '<span class="daybar"><button type="button" onclick="shift(-1)">‹</button>'
-        f'<input type="date" id="dp" value="{dia_val}" '
-        "onchange=\"if(this.value)location.search='?dia='+this.value\">"
-        '<button type="button" onclick="shift(1)">›</button></span></div>'
+        '<div class="sec daysec"><span>' + rotulo_periodo + '</span>'
+        '<span class="daybar"><button type="button" onclick="shift(-1)" title="período anterior">‹</button>'
+        f'<input type="date" id="dp" value="{p_de}" onchange="irPeriodo()">'
+        '<span class="ate">até</span>'
+        f'<input type="date" id="dp2" value="{p_ate}" onchange="irPeriodo()">'
+        '<button type="button" onclick="shift(1)" title="período seguinte">›</button></span></div>'
+        '<div class="presets">'
+        "<button type=\"button\" onclick=\"preset('hoje')\">Hoje</button>"
+        "<button type=\"button\" onclick=\"preset('7')\">7 dias</button>"
+        "<button type=\"button\" onclick=\"preset('30')\">30 dias</button>"
+        "<button type=\"button\" onclick=\"preset('mes')\">Este mês</button>"
+        "<button type=\"button\" onclick=\"preset('mespassado')\">Mês passado</button>"
+        '</div>'
         f'<div class="grid g3">{dia_cards}</div>'
-        f'<div class="sec">Leads que giraram a roleta · {"/".join(reversed(dia_val.split("-")))}</div>'
-        f'<p class="cnote"><b>{len(d.get("leads_dia_lista", []))}</b> leads giraram a roleta nesse dia. '
+        f'<div class="sec">Leads que giraram a roleta · {_br(p_de) if p_de == p_ate else _br(p_de) + " a " + _br(p_ate)}</div>'
+        f'<p class="cnote"><b>{_fmt(dd.get("leads"))}</b> leads giraram a roleta no período'
+        f'{" · mostrando os 500 mais recentes" if (dd.get("leads") or 0) > 500 else ""}. '
         '10 por página · dados mascarados (página pública).</p>'
         '<div class="tblwrap"><table class="tbl" id="leadstbl"><thead><tr>'
         '<th>Girou em</th><th>Telefone</th><th>E-mail</th><th>Cupom</th><th>Recovery</th></tr></thead><tbody>'
@@ -951,8 +999,22 @@ def dash_html(env, dia=None):
         f'<span style="opacity:.4">build {DASH_BUILD}</span></p>'
         '</div>'
         '<script>function shift(n){var i=document.getElementById("dp");'
-        'var d=new Date((i.value||new Date().toISOString().slice(0,10))+"T12:00:00");'
-        'd.setDate(d.getDate()+n);location.search="?dia="+d.toISOString().slice(0,10);}'
+        'var a=document.getElementById("dp2");'
+        'var x=new Date((i.value)+"T12:00:00"),y=new Date((a.value||i.value)+"T12:00:00");'
+        'var dias=Math.round((y-x)/864e5)+1;'
+        'x.setDate(x.getDate()+n*dias);y.setDate(y.getDate()+n*dias);'
+        'location.search="?de="+iso(x)+"&ate="+iso(y);}'
+        'function iso(d){return d.toISOString().slice(0,10);}'
+        'function irPeriodo(){var a=document.getElementById("dp").value,'
+        'b=document.getElementById("dp2").value;if(a&&b)location.search="?de="+a+"&ate="+b;}'
+        'function preset(k){var h=new Date(),a,b;h.setHours(12,0,0,0);b=new Date(h);'
+        'if(k=="hoje"){a=new Date(h);}'
+        'else if(k=="7"){a=new Date(h);a.setDate(a.getDate()-6);}'
+        'else if(k=="30"){a=new Date(h);a.setDate(a.getDate()-29);}'
+        'else if(k=="mes"){a=new Date(h.getFullYear(),h.getMonth(),1,12);}'
+        'else{a=new Date(h.getFullYear(),h.getMonth()-1,1,12);'
+        'b=new Date(h.getFullYear(),h.getMonth(),0,12);}'
+        'location.search="?de="+iso(a)+"&ate="+iso(b);}'
         'var PG=1,PP=10;function paginar(){var rs=document.querySelectorAll("#leadstbl tbody tr");'
         'var n=rs.length,tp=Math.max(1,Math.ceil(n/PP));if(PG>tp)PG=tp;if(PG<1)PG=1;'
         'rs.forEach(function(r,i){r.style.display=(i>=(PG-1)*PP&&i<PG*PP)?"":"none";});'
@@ -1016,9 +1078,11 @@ class handler(BaseHTTPRequestHandler):
                 return self._responder(200, rodar())
             except Exception as e:
                 return self._responder(500, {'erro': f'{type(e).__name__}: {e}'})
-        dia = (q.get('dia') or [None])[0]
-        if dia and not re.match(r'^\d{4}-\d{2}-\d{2}$', dia):
-            dia = None
+        def _dt_param(nome):
+            v = (q.get(nome) or [None])[0]
+            return v if (v and re.match(r'^\d{4}-\d{2}-\d{2}$', v)) else None
+        dia = _dt_param('dia')
+        de, ate = _dt_param('de'), _dt_param('ate')
 
         if quer_json:
             # Token opcional: sem DASH_READ_TOKEN a rota e publica como a pagina.
@@ -1028,12 +1092,12 @@ class handler(BaseHTTPRequestHandler):
                 return self._responder(401, {'erro': 'token invalido'})
             cors = {'Access-Control-Allow-Origin': '*', 'Cache-Control': self.CACHE_DASH}
             try:
-                return self._responder(200, dash_dados(os.environ, dia), cors)
+                return self._responder(200, dash_dados(os.environ, dia, de, ate), cors)
             except Exception as e:
                 return self._responder(500, {'erro': f'{type(e).__name__}: {e}'}, cors)
 
         try:
-            self._responder_html(200, dash_html(os.environ, dia))
+            self._responder_html(200, dash_html(os.environ, dia, de, ate))
         except Exception as e:
             self._responder_html(500, f'<pre>{type(e).__name__}: {e}</pre>')
 
