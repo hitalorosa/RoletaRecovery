@@ -225,7 +225,7 @@ def desfazer_reserva(url, key, col, ids):
 
 
 # ---------- passo 2: quem ja comprou ----------
-def yampi_indice_pedidos(alias, token, secret, paginas=YAMPI_PAGINAS):
+def yampi_indice_pedidos(alias, token, secret, paginas=YAMPI_PAGINAS, desde=None, ate=None):
     """Puxa os pedidos recentes UMA vez. Devolve (indice_por_telefone, pedidos_pagos).
 
     indice: {telefone_normalizado: [(data, pago)]}  -> usado pra nao mandar pra quem comprou
@@ -235,6 +235,15 @@ def yampi_indice_pedidos(alias, token, secret, paginas=YAMPI_PAGINAS):
     """
     H = {'User-Token': token, 'User-Secret-Key': secret, 'Accept': 'application/json'}
     base = f'https://api.dooki.com.br/v2/{alias}/orders?include=customer,status&limit=100'
+    # Sem `desde` isto puxa "as N paginas mais recentes" e torce pra alcancarem o
+    # periodo — implicito e frageil: hoje 3.000 pedidos cobrem ~3 meses, com o
+    # dobro de volume cobrem metade, e o indice passa a perder pedido em silencio.
+    # Com a janela explicita a gente pede exatamente o que precisa.
+    # A Yampi so aceita ESTE formato de filtro: date=created_at:INICIO|FIM.
+    # `date_start` e `created_at[gte]` sao aceitos e IGNORADOS (viram consulta sem
+    # filtro, o que passa despercebido).
+    if desde:
+        base += '&' + urllib.parse.urlencode({'date': f'created_at:{desde}|{ate or desde}'})
     idx, pagos = {}, []
     for page in range(1, paginas + 1):
         try:
@@ -250,6 +259,7 @@ def yampi_indice_pedidos(alias, token, secret, paginas=YAMPI_PAGINAS):
         rows = (data or {}).get('data') or []
         if not rows:
             break
+        total_pgs = (((data or {}).get('meta') or {}).get('pagination') or {}).get('total_pages')
         for o in rows:
             cu = (o.get('customer') or {}).get('data') or {}
             fone = (cu.get('phone') or {})
@@ -264,6 +274,8 @@ def yampi_indice_pedidos(alias, token, secret, paginas=YAMPI_PAGINAS):
             if pago and fd.get('formated_number'):
                 pagos.append({'id': o.get('id'), 'fone_fmt': fd['formated_number'],
                               'valor': float(o.get('value_total') or 0), 'data': cstr})
+        if total_pgs and page >= total_pgs:
+            break   # a API disse quantas paginas existem; nao precisa tentar as vazias
     return idx, pagos
 
 
@@ -681,8 +693,17 @@ def dash_dados(env, dia=None, de=None, ate=None):
     ped = {1: 0, 2: 0, 3: 0}
     d.update({'pedidos': 0, 'receita': 0.0, 'recebidos': 0, 'ctrl_comprou': 0})
     try:
+        # Janela = do dia da primeira mensagem que a recovery ja mandou ate hoje.
+        # E exatamente o intervalo onde pode existir pedido atribuivel: ninguem
+        # compra "por causa" de uma mensagem que ainda nao recebeu.
+        primeira = sb_rows(SB_URL, SB_KEY,
+            'select=msg1_enviada_em&msg1_enviada_em=not.is.null'
+            '&order=msg1_enviada_em.asc', limite=1)
+        desde = (str((primeira or [{}])[0].get('msg1_enviada_em') or '')[:10]
+                 or (agora - timedelta(days=120)).strftime('%Y-%m-%d'))
         idx, pagos = yampi_indice_pedidos(env['YAMPI_ALIAS'], env['YAMPI_TOKEN'],
-                                          env['YAMPI_SECRET'], paginas=DASH_YAMPI_PAGINAS)
+                                          env['YAMPI_SECRET'], paginas=DASH_YAMPI_PAGINAS,
+                                          desde=desde, ate=agora.strftime('%Y-%m-%d'))
         d['yampi'] = len(idx)
         pagos_fone = {}
         for p in pagos:
