@@ -570,6 +570,26 @@ def sb_rows(url, key, filtro, limite=8000):
     return rows or []
 
 
+def sb_rows_all(url, key, filtro, pagina=1000):
+    """Igual ao sb_rows, mas pagina ate acabar.
+
+    O PostgREST corta em 1000 linhas por resposta, independente do `limit` que a
+    gente pede. Quem chamou sb_rows achando que traria tudo recebeu 1000 e nao
+    percebeu: era o caso do `recebidos` do dash, que virou denominador da
+    conversao (mostrava 1.000 quando o real era 1.224) e base da atribuicao de
+    receita (so 1.000 das 1.224 pessoas eram cruzadas com a Yampi).
+    """
+    out, off = [], 0
+    while True:
+        _, rows = http_json(f'{url}/rest/v1/roleta_leads?{filtro}&limit={pagina}&offset={off}',
+                            headers=sb_headers(key), timeout=45)
+        rows = rows or []
+        out += rows
+        if len(rows) < pagina:
+            return out
+        off += len(rows)
+
+
 def dash_dados(env, dia=None):
     SB_URL = env['LEADS_SUPABASE_URL'].rstrip('/')
     SB_KEY = env['LEADS_SUPABASE_SERVICE_ROLE']
@@ -646,7 +666,7 @@ def dash_dados(env, dia=None):
             if aps:
                 d['dia']['pedidos'] += 1
                 d['dia']['receita'] += aps[0][1]
-        recebidos = sb_rows(SB_URL, SB_KEY,
+        recebidos = sb_rows_all(SB_URL, SB_KEY,
             'select=phone,msg1_enviada_em,msg2_enviada_em,msg3_enviada_em'
             '&or=(msg1_enviada_em.not.is.null,msg2_enviada_em.not.is.null,msg3_enviada_em.not.is.null)')
         d['recebidos'] = len(recebidos)
@@ -694,6 +714,7 @@ def dash_dados(env, dia=None):
             })
     except Exception:
         pass
+
     return d
 
 
@@ -955,6 +976,12 @@ def autorizado(path, headers):
 
 # ============ VERCEL HANDLER ============
 class handler(BaseHTTPRequestHandler):
+    # O painel custa ~13s pra montar (11 contagens no Supabase em sequencia mais o
+    # indice da Yampi) e o resultado e igual pra todo mundo. Com `s-maxage` a CDN da
+    # Vercel guarda a copia pronta; com `stale-while-revalidate` ela entrega a copia
+    # velha NA HORA e revalida por tras — ninguem espera o recalculo.
+    CACHE_DASH = 'public, s-maxage=300, stale-while-revalidate=3600'
+
     def _responder(self, code, payload, extra=None):
         body = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
         self.send_response(code)
@@ -969,6 +996,7 @@ class handler(BaseHTTPRequestHandler):
         body = html.encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Cache-Control', self.CACHE_DASH)
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -998,7 +1026,7 @@ class handler(BaseHTTPRequestHandler):
             esperado = os.environ.get('DASH_READ_TOKEN', '')
             if esperado and (q.get('token') or [''])[0] != esperado:
                 return self._responder(401, {'erro': 'token invalido'})
-            cors = {'Access-Control-Allow-Origin': '*', 'Cache-Control': 'public, max-age=60'}
+            cors = {'Access-Control-Allow-Origin': '*', 'Cache-Control': self.CACHE_DASH}
             try:
                 return self._responder(200, dash_dados(os.environ, dia), cors)
             except Exception as e:
