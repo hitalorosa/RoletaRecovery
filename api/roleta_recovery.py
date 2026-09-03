@@ -600,6 +600,13 @@ def dash_dados(env, dia=None):
     d['msgs_hoje'] = sum(envh.values())
     d['controle'] = sb_count(SB_URL, SB_KEY, 'controle=is.true') or 0
 
+    # Custo: cada mensagem e um template de marketing do WhatsApp, cobrado em DOLAR.
+    # A receita vem em real, entao sem converter o ROAS sai ~5x maior do que e.
+    # Os dois valores sao env var de proposito: preco e cambio mudam sem deploy.
+    d['custo_msg_usd'] = float(env.get('CUSTO_MSG_USD') or 0.01)
+    d['usd_brl'] = float(env.get('USD_BRL') or 5.15)
+    d['gasto'] = d['msgs_total'] * d['custo_msg_usd'] * d['usd_brl']
+
     # ---- visao do DIA escolhido (fuso BR = UTC-3) ----
     try:
         base = datetime.strptime(dia, '%Y-%m-%d').replace(tzinfo=timezone.utc)
@@ -665,6 +672,10 @@ def dash_dados(env, dia=None):
     except Exception as ex:
         d['erro'] = f'{type(ex).__name__}: {str(ex)[:150]}'
     d['ped'] = ped
+    # ROAS = receita / gasto. Sem gasto nao existe ROAS (nao e zero, e indefinido).
+    d['roas'] = (d['receita'] / d['gasto']) if d['gasto'] else None
+    d['dia']['gasto'] = d['dia']['msgs'] * d['custo_msg_usd'] * d['usd_brl']
+    d['dia']['roas'] = (d['dia']['receita'] / d['dia']['gasto']) if d['dia']['gasto'] else None
     d['dia'].pop('_receb', None)
 
     # lista de TODOS os leads que giraram a roleta NO DIA (mascarada — pagina publica)
@@ -696,6 +707,16 @@ def _fmt(n):
 
 def _money(v):
     return 'R$ ' + f'{(v or 0):,.0f}'.replace(',', '.')
+
+
+def _roas(v):
+    return '—' if not v else f'{v:,.1f}x'.replace('.', ',')
+
+
+def _money2(v):
+    """Com centavos. O gasto e da ordem de centavos por mensagem: arredondar pra
+    real inteiro faz o gasto de um dia virar 'R$ 4' e some a precisao."""
+    return 'R$ ' + f'{(v or 0):,.2f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
 
 
 def _mask_phone(p):
@@ -750,7 +771,11 @@ def dash_html(env, dia=None):
         kpi('RECEITA RECUPERADA', _money(rec), f'{_fmt(ped)} pedidos atribuídos', 'accent') +
         kpi('PEDIDOS RECUPERADOS', _fmt(ped), f'de {_fmt(recb)} que receberam') +
         kpi('TICKET MÉDIO', _money(ticket), 'por pedido recuperado') +
-        kpi('CONVERSÃO', f'{conv_r:.1f}%', f'{_fmt(ped)} de {_fmt(recb)} compraram', 'accent')
+        kpi('CONVERSÃO', f'{conv_r:.1f}%', f'{_fmt(ped)} de {_fmt(recb)} compraram', 'accent') +
+        kpi('GASTO', _money2(d['gasto']),
+            f"{_fmt(d['msgs_total'])} msgs × US$ {d['custo_msg_usd']:.2f} "
+            f"(dólar a {_money2(d['usd_brl'])})") +
+        kpi('ROAS', _roas(d.get('roas')), 'receita ÷ gasto', 'accent')
     )
 
     metr = (
@@ -768,7 +793,9 @@ def dash_html(env, dia=None):
         kpi('MSGS ENVIADAS', _fmt(dd.get('msgs')),
             f"M1 {_fmt(envd.get(1))} · M2 {_fmt(envd.get(2))} · M3 {_fmt(envd.get(3))}") +
         kpi('PEDIDOS RECUPERADOS', _fmt(dd.get('pedidos')), 'receberam e compraram', 'accent') +
-        kpi('RECEITA RECUPERADA', _money(dd.get('receita')), 'no dia', 'accent')
+        kpi('RECEITA RECUPERADA', _money(dd.get('receita')), 'no dia', 'accent') +
+        kpi('GASTO DO DIA', _money2(dd.get('gasto')), f"{_fmt(dd.get('msgs'))} msgs") +
+        kpi('ROAS DO DIA', _roas(dd.get('roas')), 'receita ÷ gasto', 'accent')
     )
 
     janelas = [
@@ -811,6 +838,7 @@ def dash_html(env, dia=None):
         '.pill.on{background:rgba(67,184,159,.14);color:var(--ac)}'
         '.pill.off{background:rgba(224,179,72,.14);color:#e0b348}'
         '.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}'
+        '.grid.g3{grid-template-columns:repeat(3,1fr)}'
         '@media(max-width:820px){.grid{grid-template-columns:repeat(2,1fr)}}'
         '@media(max-width:480px){.grid{grid-template-columns:1fr}}'
         '.kpi{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 18px 16px}'
@@ -865,7 +893,7 @@ def dash_html(env, dia=None):
         '</style></head><body><div class="wrap">'
         '<div class="top"><div class="brand"><h1>Roleta Recovery</h1><p>Dry Skin · recuperação via WhatsApp</p></div>'
         f'{status}</div>'
-        f'<div class="grid">{kpis}</div>'
+        f'<div class="grid g3">{kpis}</div>'
         '<div class="banner">'
         f'<h3>Roleta Recovery {status}</h3>'
         '<p>Follow-up automático via WhatsApp pra quem gira a roleta e não compra. '
@@ -882,7 +910,7 @@ def dash_html(env, dia=None):
         f'<input type="date" id="dp" value="{dia_val}" '
         "onchange=\"if(this.value)location.search='?dia='+this.value\">"
         '<button type="button" onclick="shift(1)">›</button></span></div>'
-        f'<div class="grid">{dia_cards}</div>'
+        f'<div class="grid g3">{dia_cards}</div>'
         f'<div class="sec">Leads que giraram a roleta · {"/".join(reversed(dia_val.split("-")))}</div>'
         f'<p class="cnote"><b>{len(d.get("leads_dia_lista", []))}</b> leads giraram a roleta nesse dia. '
         '10 por página · dados mascarados (página pública).</p>'
